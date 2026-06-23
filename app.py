@@ -1,120 +1,283 @@
-import streamlit as st
+import os
+import glob
+import numpy as np
 import pandas as pd
-import plotly.express as px
-import requests
-from datetime import datetime
+import matplotlib.pyplot as plt
+import streamlit as pd_st  # 이름 충돌 방지
+import streamlit as st
+from scipy import stats
+from scipy.fft import rfft, rfftfreq
+from scipy.io import loadmat
+import kagglehub
 
-# --- 페이지 설정 ---
-st.set_page_config(page_title="팀 예산 관리 대시보드", page_icon="📊", layout="wide")
+# -----------------------------------------------------------------------------
+# 1. 스트림릿 페이지 설정 및 스타일 (한글 폰트 포함)
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="베어링 진동 기반 CBM 진단 시스템", layout="wide")
 
-# --- 메인 로직 ---
-st.title("📊 팀 예산 관리 시스템")
-st.markdown("부장님 보고용 월별 예산 취합 및 대시보드 (Google Sheets 연동)")
+# Matplotlib 한글 깨짐 방지 설정
+plt.rcParams["axes.unicode_minus"] = False
+# 로컬 환경에 설치된 한글 폰트 지정 (예: Windows: Malgun Gothic, Mac: AppleGothic)
+import platform
+if platform.system() == "Windows":
+    plt.rcParams["font.family"] = "Malgun Gothic"
+elif platform.system() == "Darwin":
+    plt.rcParams["font.family"] = "AppleGothic"
+else:
+    plt.rcParams["font.family"] = "DejaVu Sans" # 리눅스 기본 (필요시 NanumBarunGothic 지정)
 
-# Google Apps Script Web App URL (Streamlit Secrets에서 가져오기)
-try:
-    WEB_APP_URL = st.secrets["apps_script_url"]
-except:
-    st.error("⚠️ Streamlit Secrets에 `apps_script_url`을 설정해주세요. (README 참조)")
-    st.stop()
+st.title("⚙️ 베어링 진동 신호 기반 상태 모니터링 (CBM) 시스템")
+st.markdown("Kaggle의 **CWRU 베어링 데이터셋**을 활용하여 정상/이상 상태를 분석하고 진단합니다.")
 
-# 구글 시트 데이터 로드 (Apps Script GET 요청)
-try:
-    response = requests.get(WEB_APP_URL)
-    data = response.json()
+# -----------------------------------------------------------------------------
+# 2. 사이드바 - 데이터 및 하이퍼파라미터 설정
+# -----------------------------------------------------------------------------
+st.sidebar.header("🛠️ 시스템 설정")
+
+# 2-1. 데이터셋 다운로드 및 로드 모드 선택
+data_source = st.sidebar.radio("데이터 소스 선택", ["Kaggle 자동 다운로드 (CWRU)", "임시 예제 신호 사용"])
+FS = st.sidebar.number_input("샘플링 주파수 (Hz)", value=12000, step=1000)
+
+# 2-2. 진단 임계치(Threshold) 설정
+st.sidebar.subheader("🚨 진단 기준치 설정")
+kurtosis_threshold = st.sidebar.slider("Kurtosis 주의 기준", 2.0, 7.0, 5.0, 0.1)
+crest_threshold = st.sidebar.slider("Crest Factor 주의 기준", 2.0, 7.0, 4.0, 0.1)
+
+# -----------------------------------------------------------------------------
+# 3. 핵심 연산 함수들
+# -----------------------------------------------------------------------------
+@st.cache_data
+def load_kaggle_data():
+    """Kaggle에서 베어링 데이터를 다운로드하고 정상/이상 신호를 추출합니다."""
+    try:
+        path = kagglehub.dataset_download("vinayak123tyagi/bearing-dataset")
+        mat_files = glob.glob(os.path.join(path, "**/*.mat"), recursive=True)
+        
+        # CWRU 예시 파일 필터링 (정상: 97.mat, 외륜 결함: 105.mat 예시)
+        normal_path = [f for f in mat_files if "97.mat" in f or "97" in os.path.basename(f)]
+        fault_path = [f for f in mat_files if "105.mat" in f or "105" in os.path.basename(f)]
+        
+        if normal_path and fault_path:
+            mat_n = loadmat(normal_path[0])
+            mat_f = loadmat(fault_path[0])
+            
+            # 드라이브 엔드(DE) 타임 데이터 키 찾기
+            n_key = [k for k in mat_n.keys() if "DE_time" in k][0]
+            f_key = [k for k in mat_f.keys() if "DE_time" in k][0]
+            
+            # 2초 분량 샘플링
+            max_samples = FS * 2
+            ns = np.asarray(mat_n[n_key]).ravel()[:max_samples]
+            fs = np.asarray(mat_f[f_key]).ravel()[:max_samples]
+            return ns, fs, "CWRU Bearing Dataset", True
+    except Exception as e:
+        st.sidebar.error(f"Kaggle 데이터 로드 실패: {e}")
+    return None, None, "", False
+
+def generate_mock_data():
+    """데이터 다운로드가 안 되거나 임시 모드일 때 사용할 가상 데이터 생성"""
+    duration = 2.0
+    t = np.arange(0, duration, 1 / FS)
+    ns = 0.8 * np.sin(2 * np.pi * 60 * t) + 0.08 * np.random.randn(len(t))
+    fs = ns.copy()
+    impact_positions = np.arange(0, len(t), int(FS / 90))
+    for pos in impact_positions:
+        if pos + 40 < len(fs):
+            fs[pos:pos+40] += np.hanning(40) * np.random.uniform(1.5, 2.2)
+    return ns, fs, "임시 가상 데이터셋"
+
+# 데이터 확보
+if data_source == "Kaggle 자동 다운로드 (CWRU)":
+    with st.spinner("Kaggle에서 베어링 데이터를 다운로드 중입니다..."):
+        normal_signal, fault_signal, dataset_name, success = load_kaggle_data()
+    if not success:
+        st.warning("Kaggle 데이터를 가져오지 못해 가상 데이터로 대체합니다.")
+        normal_signal, fault_signal, dataset_name = generate_mock_data()
+else:
+    normal_signal, fault_signal, dataset_name = generate_mock_data()
+
+# 특징값 계산 함수
+def calculate_features(signal):
+    signal = np.asarray(signal).ravel()
+    rms = np.sqrt(np.mean(signal ** 2))
+    peak = np.max(np.abs(signal))
+    kurtosis = stats.kurtosis(signal, fisher=False)
+    skewness = stats.skew(signal)
+    crest_factor = peak / rms if rms > 0 else np.nan
+    return {
+        "mean": np.mean(signal),
+        "std": np.std(signal),
+        "rms": rms,
+        "peak": peak,
+        "kurtosis": kurtosis,
+        "skewness": skewness,
+        "crest_factor": crest_factor,
+        "mean_abs": np.mean(np.abs(signal)),
+    }
+
+# 구간별 특징값 추출 함수
+def window_features(signal, fs, window_sec=0.2, step_sec=0.1):
+    signal = np.asarray(signal).ravel()
+    window = int(fs * window_sec)
+    step = int(fs * step_sec)
+    rows = []
+    for start in range(0, len(signal) - window + 1, step):
+        seg = signal[start:start + window]
+        rows.append({"time_sec": start / fs, **calculate_features(seg)})
+    return pd.DataFrame(rows)
+
+# FFT 연산 함수
+def compute_fft(signal, fs):
+    signal = np.asarray(signal).ravel()
+    signal = signal - np.mean(signal)
+    n = len(signal)
+    window = np.hanning(n)
+    spectrum = np.abs(rfft(signal * window)) / n
+    freq = rfftfreq(n, 1 / fs)
+    return freq, spectrum
+
+# -----------------------------------------------------------------------------
+# 4. 웹 화면 대시보드 구성
+# -----------------------------------------------------------------------------
+tabs = st.tabs(["📊 데이터 개요 및 시각화", "📈 주파수 분석 (FFT)", "🚨 실시간 트렌드 및 고장 진단"])
+
+# -----------------------------------------------------------------------------
+# Tab 1: 데이터 개요 및 시각화
+# -----------------------------------------------------------------------------
+with tabs[0]:
+    st.subheader("📋 분석 데이터 정보")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("데이터셋 이름", dataset_name)
+    col2.metric("샘플링 주파수", f"{FS} Hz")
+    col3.metric("데이터 길이", f"{len(normal_signal)} 샘플")
+
+    # 시간 도메인 파형 시각화
+    st.subheader("⏱️ 시간 영역 진동 신호 파형 (0.2초 구간)")
+    seconds_to_show = 0.2
+    n_samples = min(len(normal_signal), int(FS * seconds_to_show))
+    time_axis = np.arange(n_samples) / FS
+
+    fig, ax = plt.subplots(2, 1, figsize=(12, 5), sharex=True)
+    ax[0].plot(time_axis, normal_signal[:n_samples], color='#1f77b4')
+    ax[0].set_title("정상 진동 신호")
+    ax[0].grid(alpha=0.3)
     
-    if not data:
-        df = pd.DataFrame(columns=["ID", "연월", "팀원", "항목", "금액"])
-    else:
-        df = pd.DataFrame(data)
-except Exception as e:
-    st.error(f"⚠️ 구글 시트 연결에 실패했습니다.\n\n에러 내용: {e}")
-    st.stop()
+    ax[1].plot(time_axis, fault_signal[:n_samples], color='#d62728')
+    ax[1].set_title("이상 진동 신호")
+    ax[1].set_xlabel("Time (s)")
+    ax[1].grid(alpha=0.3)
+    st.pyplot(fig)
 
-# 탭 구성
-tab1, tab2 = st.tabs(["📝 데이터 입력", "📈 전체 대시보드"])
+    # 전체 특징값 비교 테이블 및 바차트
+    st.subheader("📊 통계적 특징값(Features) 비교")
+    feature_df = pd.DataFrame([
+        {"state": "정상 (Normal)", **calculate_features(normal_signal)},
+        {"state": "이상 (Fault)", **calculate_features(fault_signal)},
+    ])
+    st.dataframe(feature_df.style.format(precision=4))
 
-# --- TAB 1: 데이터 입력 ---
-with tab1:
-    st.subheader("새로운 예산 내역 입력")
-    with st.form("budget_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            member = st.selectbox("팀원 선택", ["부장님", "팀원1", "팀원2", "팀원3", "팀원4"])
-            month = st.date_input("해당 월 (날짜 선택)", datetime.today()).strftime("%Y-%m")
-        with col2:
-            category = st.selectbox("예산 항목", ["수선유지비", "비품", "개량공사"])
-            amount = st.number_input("사용 금액 (원)", min_value=0, step=1000)
+    # 바 차트 시각화
+    plot_cols = ["rms", "peak", "kurtosis", "crest_factor"]
+    fig2, ax2 = plt.subplots(figsize=(10, 4))
+    feature_df.set_index("state")[plot_cols].T.plot(kind="bar", ax=ax2)
+    plt.title("정상/이상 특징값 비교")
+    plt.ylabel("Feature value")
+    plt.xticks(rotation=0)
+    plt.grid(axis="y", alpha=0.3)
+    st.pyplot(fig2)
 
-        submitted = st.form_submit_button("기록 저장하기")
+# -----------------------------------------------------------------------------
+# Tab 2: 주파수 분석 (FFT)
+# -----------------------------------------------------------------------------
+with tabs[1]:
+    st.subheader("🔍 Fast Fourier Transform (FFT) 분석")
+    max_freq = st.slider("시각화할 최대 주파수 범위 (Hz)", 100, int(FS/2), 1000)
 
-        if submitted:
-            new_id = int(datetime.now().timestamp())
-            
-            # Apps Script로 전송할 페이로드 데이터
-            payload = {
-                "ID": new_id, 
-                "연월": month, 
-                "팀원": member, 
-                "항목": category, 
-                "금액": amount
-            }
-            
-            # POST 요청으로 데이터 전송
-            try:
-                res = requests.post(WEB_APP_URL, json=payload)
-                if res.status_code == 200 and res.json().get("status") == "success":
-                    st.success("✅ 구글 스프레드시트에 성공적으로 저장되었습니다!")
-                    st.rerun() # 화면 새로고침
-                else:
-                    st.error(f"❌ 저장에 실패했습니다: {res.text}")
-            except Exception as e:
-                st.error(f"❌ 통신 중 오류가 발생했습니다: {e}")
+    fig_fft, ax_fft = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+    
+    # 정상 FFT
+    freq_n, spec_n = compute_fft(normal_signal, FS)
+    mask_n = freq_n <= max_freq
+    ax_fft[0].plot(freq_n[mask_n], spec_n[mask_n], color='#1f77b4')
+    ax_fft[0].set_title("정상 신호 주파수 스펙트럼")
+    ax_fft[0].grid(alpha=0.3)
+    
+    # 이상 FFT
+    freq_f, spec_f = compute_fft(fault_signal, FS)
+    mask_f = freq_f <= max_freq
+    ax_fft[1].plot(freq_f[mask_f], spec_f[mask_f], color='#d62728')
+    ax_fft[1].set_title("이상 신호 주파수 스펙트럼")
+    ax_fft[1].set_xlabel("Frequency (Hz)")
+    ax_fft[1].grid(alpha=0.3)
+    
+    st.pyplot(fig_fft)
 
-    st.subheader("📂 최근 입력 내역 (Google Sheets)")
-    st.dataframe(df.tail(10).sort_index(ascending=False), use_container_width=True)
+# -----------------------------------------------------------------------------
+# Tab 3: 실시간 트렌드 및 고장 진단
+# -----------------------------------------------------------------------------
+with tabs[2]:
+    st.subheader("📈 시계열 구간별 특징값 추세 (Trend)")
+    
+    # 구간 계산
+    normal_win = window_features(normal_signal, FS)
+    fault_win = window_features(fault_signal, FS)
+    normal_win["state"] = "normal"
+    fault_win["state"] = "fault"
+    trend_df = pd.concat([normal_win, fault_win], ignore_index=True)
 
-# --- TAB 2: 전체 대시보드 ---
-with tab2:
-    if df.empty:
-        st.info("아직 입력된 데이터가 없습니다.")
-    else:
-        # 금액 데이터를 숫자형으로 변환
-        df['금액'] = pd.to_numeric(df['금액'])
+    # 정상 데이터의 베이스라인 통계치 계산 후 RMS 임계치 자동 설정
+    normal_baseline = normal_win[["rms", "kurtosis", "crest_factor"]].agg(["mean", "std"])
+    rms_threshold = normal_baseline.loc["mean", "rms"] + 3 * normal_baseline.loc["std", "rms"]
+
+    # 동적 룰 기반 진단 함수
+    def diagnose(row):
+        reasons = []
+        if row["rms"] > rms_threshold: reasons.append("RMS 증가")
+        if row["kurtosis"] > kurtosis_threshold: reasons.append("충격성 증가")
+        if row["crest_factor"] > crest_threshold: reasons.append("Crest Factor 증가")
+
+        if len(reasons) >= 2: return "위험", ", ".join(reasons)
+        if len(reasons) == 1: return "주의", reasons[0]
+        return "정상", "-"
+
+    # 추세 그래프 그리기
+    for col in ["rms", "kurtosis", "crest_factor"]:
+        fig_t, ax_t = plt.subplots(figsize=(12, 2.5))
+        for state, group in trend_df.groupby("state"):
+            ax_t.plot(group["time_sec"], group[col], label="정상 구간 시퀀스" if state=='normal' else "이상 발생 구간 시퀀스")
         
-        # 상단 통계 수치
-        total_amount = df['금액'].sum()
-        top_category = df.groupby('항목')['금액'].sum().idxmax()
-        top_category_amount = df.groupby('항목')['금액'].sum().max()
-        data_count = len(df)
+        # 가이드라인(임계치) 표시
+        if col == "rms":
+            ax_t.axhline(rms_threshold, color='r', linestyle='--', label=f'임계치 ({rms_threshold:.4f})')
+        elif col == "kurtosis":
+            ax_t.axhline(kurtosis_threshold, color='r', linestyle='--', label=f'임계치 ({kurtosis_threshold:.1f})')
+        elif col == "crest_factor":
+            ax_t.axhline(crest_threshold, color='r', linestyle='--', label=f'임계치 ({crest_threshold:.1f})')
+            
+        ax_t.set_title(f"시간 흐름에 따른 {col.upper()} 지표 추세")
+        ax_t.set_xlabel("Time (s)")
+        ax_t.legend()
+        ax_t.grid(alpha=0.3)
+        st.pyplot(fig_t)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("전체 누적 사용액", f"{total_amount:,.0f}원")
-        col2.metric("최대 사용 항목", f"{top_category}", f"{top_category_amount:,.0f}원")
-        col3.metric("데이터 건수", f"{data_count}건")
+    # 실시간 진단 결과 리포트 테이블
+    st.subheader("🚨 이상 신호 시퀀스에 대한 실시간 진단 결과")
+    diagnosis = fault_win.copy()
+    diagnosis[["진단 결과", "원인"]] = diagnosis.apply(
+        lambda row: pd.Series(diagnose(row)), axis=1
+    )
+    
+    # 결과 요약 표시
+    counts = diagnosis["진단 결과"].value_counts()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🟢 정상 판정 구간", counts.get("정상", 0))
+    c2.metric("🟡 주의 필요 구간", counts.get("주의", 0))
+    c3.metric("🔴 위험 경보 구간", counts.get("위험", 0))
 
-        st.divider()
-
-        # 차트 영역
-        col_chart1, col_chart2 = st.columns(2)
-        with col_chart1:
-            st.markdown("**🏠 항목별 예산 분포**")
-            cat_df = df.groupby('항목')['금액'].sum().reset_index()
-            fig_cat = px.pie(cat_df, values='금액', names='항목', hole=0.4,
-                             color_discrete_sequence=['#3b82f6', '#10b981', '#8b5cf6'])
-            st.plotly_chart(fig_cat, use_container_width=True)
-
-        with col_chart2:
-            st.markdown("**👥 팀원별 누적 사용액**")
-            mem_df = df.groupby('팀원')['금액'].sum().reset_index()
-            fig_mem = px.bar(mem_df, x='팀원', y='금액', text_auto='.2s',
-                             color_discrete_sequence=['#60a5fa'])
-            st.plotly_chart(fig_mem, use_container_width=True)
-
-        st.divider()
-        
-        # 월별/항목별 요약 피벗 테이블
-        st.markdown("**📅 월별/항목별 요약 테이블 (취합본)**")
-        pivot_df = df.pivot_table(index='연월', columns='항목', values='금액', aggfunc='sum', fill_value=0)
-        pivot_df['합계'] = pivot_df.sum(axis=1)
-        st.dataframe(pivot_df.style.format("{:,.0f}"), use_container_width=True)
+    st.dataframe(
+        diagnosis[["time_sec", "rms", "kurtosis", "crest_factor", "진단 결과", "원인"]].style.map(
+            lambda val: 'background-color: #ffcccc' if val == '위험' else ('background-color: #fff2cc' if val == '주의' else ''),
+            subset=['진단 결과']
+        ),
+        use_container_width=True
+    )
